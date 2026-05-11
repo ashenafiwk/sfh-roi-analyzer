@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local data / outputs (regenerable)
+portfolio.csv
+portfolio_*.csv
+*.local.csv
+
+# Streamlit
+.streamlit/secrets.toml
