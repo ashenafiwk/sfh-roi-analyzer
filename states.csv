@@ -1,0 +1,52 @@
+state,state_name,property_tax_rate,avg_insurance_yr,notes
+AL,Alabama,0.0041,1400,Lowest property tax in Southeast
+AK,Alaska,0.0119,1100,
+AZ,Arizona,0.0063,1500,
+AR,Arkansas,0.0062,1900,Tornado-prone areas drive insurance
+CA,California,0.0075,1450,Prop 13 caps assessment growth; wildfire zones higher
+CO,Colorado,0.0055,2000,Wildfire risk lifts insurance
+CT,Connecticut,0.0215,1600,High effective tax state
+DE,Delaware,0.0061,1100,
+DC,District of Columbia,0.0085,1500,Homestead exemption available
+FL,Florida,0.0091,3700,No state income tax; very high wind/flood insurance
+GA,Georgia,0.0092,1800,
+HI,Hawaii,0.0032,1500,Lowest effective property tax rate in US
+ID,Idaho,0.0069,1100,
+IL,Illinois,0.0227,1500,Second-highest property tax in US
+IN,Indiana,0.0085,1500,
+IA,Iowa,0.0157,1600,
+KS,Kansas,0.0141,2700,Tornado-prone
+KY,Kentucky,0.0086,1600,
+LA,Louisiana,0.0055,2900,Hurricane/flood insurance very high in coastal parishes
+ME,Maine,0.0136,1100,
+MD,Maryland,0.0109,1300,Rates vary by county (Mont 0.87%; PG 1.15%)
+MA,Massachusetts,0.0123,1500,
+MI,Michigan,0.0154,1300,
+MN,Minnesota,0.0112,2300,
+MS,Mississippi,0.0081,1900,
+MO,Missouri,0.0097,1700,
+MT,Montana,0.0084,1700,Wildfire risk in western counties
+NE,Nebraska,0.0173,2600,Tornado/hail belt
+NV,Nevada,0.0060,1100,No state income tax
+NH,New Hampshire,0.0218,1400,No income tax — funded heavily by property tax
+NJ,New Jersey,0.0249,1400,Highest property tax in US
+NM,New Mexico,0.0080,1500,
+NY,New York,0.0172,1500,NYC has its own classification system
+NC,North Carolina,0.0084,1700,
+ND,North Dakota,0.0098,2000,
+OH,Ohio,0.0162,1300,
+OK,Oklahoma,0.0090,3700,Tornado alley — very high insurance
+OR,Oregon,0.0097,1100,Wildfire risk in east/south
+PA,Pennsylvania,0.0158,1200,
+RI,Rhode Island,0.0163,1700,
+SC,South Carolina,0.0057,1900,Coastal areas higher
+SD,South Dakota,0.0131,3000,
+TN,Tennessee,0.0071,2400,
+TX,Texas,0.0180,4200,No income tax; very high insurance (hail/wind)
+UT,Utah,0.0066,1200,
+VT,Vermont,0.0190,900,
+VA,Virginia,0.0082,1300,
+WA,Washington,0.0098,1100,
+WV,West Virginia,0.0058,1500,
+WI,Wisconsin,0.0185,1300,
+WY,Wyoming,0.0061,1300,

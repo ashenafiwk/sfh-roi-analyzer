@@ -11,6 +11,7 @@ Run locally:
 
 import io
 import os
+import re
 from datetime import datetime
 
 import pandas as pd
@@ -20,19 +21,32 @@ from roi import Assumptions, analyze, verdict
 from scrapers import parse_listing
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SUBMARKETS_CSV = os.path.join(SCRIPT_DIR, "submarkets.csv")
+STATES_CSV = os.path.join(SCRIPT_DIR, "states.csv")
 
 st.set_page_config(page_title="SFH ROI Analyzer", page_icon="🏠", layout="wide")
 
 
+# ─── Reference data ──────────────────────────────────────────────────────────
 @st.cache_data
-def load_submarkets():
-    df = pd.read_csv(SUBMARKETS_CSV, dtype={"zip": str})
-    return df
+def load_states():
+    return pd.read_csv(STATES_CSV, dtype={"state": str})
 
 
-submarkets = load_submarkets()
-SUBMARKETS_BY_ZIP = {row["zip"]: row for _, row in submarkets.iterrows()}
+states = load_states()
+STATES_BY_CODE = {row["state"]: row for _, row in states.iterrows()}
+STATE_LABELS = [f"{r['state']} — {r['state_name']}" for _, r in states.iterrows()]
+LABEL_TO_CODE = {f"{r['state']} — {r['state_name']}": r["state"] for _, r in states.iterrows()}
+
+STATE_IN_ADDR = re.compile(r"\b([A-Z]{2})\b\s*\d{5}")
+
+
+def state_from_address(addr: str) -> str | None:
+    if not addr:
+        return None
+    m = STATE_IN_ADDR.search(addr.upper())
+    if m and m.group(1) in STATES_BY_CODE:
+        return m.group(1)
+    return None
 
 
 # ─── Session state initialization ────────────────────────────────────────────
@@ -54,33 +68,21 @@ def portfolio_df() -> pd.DataFrame:
 
 # ─── Sidebar: Assumptions ────────────────────────────────────────────────────
 st.sidebar.header("Assumptions")
-rate = st.sidebar.slider("Mortgage rate (%)", 4.0, 10.0, 7.25, 0.05) / 100
-down = st.sidebar.slider("Down payment (%)", 5, 50, 20, 5) / 100
+rate = st.sidebar.slider("Mortgage rate (%)", 3.0, 12.0, 7.25, 0.05) / 100
+down = st.sidebar.slider("Down payment (%)", 3, 50, 20, 1) / 100
 vacancy = st.sidebar.slider("Vacancy (%)", 0, 15, 6, 1) / 100
 mgmt = st.sidebar.slider("Property mgmt (% of rent)", 0, 12, 8, 1) / 100
 maint = st.sidebar.slider("Maintenance (% of rent)", 0, 15, 8, 1) / 100
-insurance = st.sidebar.number_input("Annual insurance ($)", 500, 5000, 1200, 100)
 appreciation = st.sidebar.slider("Long-run appreciation (%)", 0.0, 8.0, 3.5, 0.5) / 100
 rent_growth = st.sidebar.slider("Long-run rent growth (%)", 0.0, 8.0, 3.0, 0.5) / 100
 loan_years = st.sidebar.selectbox("Loan term (years)", [15, 20, 30], index=2)
 
-a = Assumptions(
-    down_pct=down,
-    mortgage_rate=rate,
-    loan_years=loan_years,
-    insurance_yr=insurance,
-    vacancy_pct=vacancy,
-    maintenance_pct=maint,
-    mgmt_pct=mgmt,
-    appreciation=appreciation,
-    rent_growth=rent_growth,
-)
-
 with st.sidebar.expander("💡 Scenario tips"):
     st.markdown(
-        "**Refi later?** Drop the rate slider to 5.75% to simulate a refinance.\n\n"
+        "**Refi later?** Drop the rate slider by 1-2 points to model a refinance.\n\n"
         "**House hack?** Set down to 5% (FHA owner-occupant). Use room-rental totals as rent.\n\n"
-        "**All cash?** Set down to 50%+ — cash-on-cash converges to cap rate."
+        "**All cash?** Set down to 50%+ — cash-on-cash converges to cap rate.\n\n"
+        "**Self-manage?** Set property mgmt to 0%."
     )
 
 st.sidebar.markdown("---")
@@ -91,18 +93,12 @@ st.sidebar.caption(
 # ─── Header ──────────────────────────────────────────────────────────────────
 st.title("🏠 SFH ROI Analyzer")
 st.caption(
-    "**SFH** = Single Family Home. Buy-and-hold rental investment math: cap rate, "
-    "cash-on-cash, monthly cash flow, 5-year IRR, plus the classic 1% rule, GRM, and DSCR."
-)
-st.info(
-    "📍 **DC Metro Edition** — reference market data covers 26 zip codes within "
-    "20 miles of 20901 (Silver Spring, MD). You can analyze any property, but the "
-    "rent/tax auto-fill only triggers for these zips.",
-    icon="📍",
+    "**SFH** = Single Family Home. Buy-and-hold rental investment math for any US property: "
+    "cap rate, cash-on-cash, monthly cash flow, 5-year IRR, plus the classic 1% rule, GRM, and DSCR."
 )
 
-tab_eval, tab_portfolio, tab_market, tab_about = st.tabs(
-    ["Evaluate property", "My portfolio", "Market reference", "About"]
+tab_eval, tab_portfolio, tab_states, tab_about = st.tabs(
+    ["Evaluate property", "My portfolio", "State reference", "About"]
 )
 
 
@@ -140,38 +136,68 @@ with tab_eval:
 
     fetched = st.session_state.fetched
 
+    # ─── State selector — drives default tax + insurance ─────────────────────
+    detected_state = state_from_address(fetched.get("address", ""))
+    default_state_idx = 0
+    if detected_state:
+        try:
+            default_state_idx = list(STATES_BY_CODE).index(detected_state)
+        except ValueError:
+            default_state_idx = 0
+
+    st.markdown("### Location")
+    sc1, sc2 = st.columns([2, 5])
+    state_label = sc1.selectbox("State", STATE_LABELS, index=default_state_idx)
+    state_code = LABEL_TO_CODE[state_label]
+    state_row = STATES_BY_CODE[state_code]
+    sc2.caption(
+        f"Defaults for **{state_row['state_name']}**: "
+        f"property tax {state_row['property_tax_rate']*100:.2f}% • "
+        f"insurance ~${int(state_row['avg_insurance_yr']):,}/yr"
+        + (f" — {state_row['notes']}" if isinstance(state_row.get('notes'), str) and state_row['notes'] else "")
+    )
+
+    # ─── Property details ────────────────────────────────────────────────────
     st.markdown("### Property details")
     c1, c2, c3 = st.columns(3)
     address = c1.text_input("Address", value=fetched.get("address", ""))
-    zip_code = c2.text_input("Zip code", value=str(fetched.get("zip", "20707")), max_chars=5)
-    price = c3.number_input("Price ($)", min_value=50000, max_value=2_000_000,
-                            value=int(fetched.get("price") or 430000), step=5000)
+    zip_code = c2.text_input("Zip code", value=str(fetched.get("zip") or ""), max_chars=5)
+    price = c3.number_input("Price ($)", min_value=20_000, max_value=10_000_000,
+                            value=int(fetched.get("price") or 400_000), step=5000)
 
     c4, c5, c6 = st.columns(3)
     beds = c4.number_input("Beds", 1, 10, int(fetched.get("beds") or 3))
     baths = c5.number_input("Baths", 1.0, 10.0, float(fetched.get("baths") or 2), step=0.5)
-    sqft = c6.number_input("Sqft", 400, 10000, int(fetched.get("sqft") or 1500), step=50)
+    sqft = c6.number_input("Sqft", 200, 20_000, int(fetched.get("sqft") or 1500), step=50)
 
-    sub_row = SUBMARKETS_BY_ZIP.get(zip_code)
-    default_rent = int(fetched.get("rent_zestimate") or
-                       (sub_row["est_3br_sfh_rent"] if sub_row is not None else 3000))
-    default_tax = float(sub_row["property_tax_rate"]) if sub_row is not None else 0.0087
+    # Default rent: Zestimate if scraped, else 1% rule (price × 0.008)
+    default_rent = int(fetched.get("rent_zestimate") or max(round(price * 0.008), 800))
+    default_tax = float(state_row["property_tax_rate"])
+    default_insurance = int(state_row["avg_insurance_yr"])
 
     c7, c8, c9 = st.columns(3)
-    rent_mo = c7.number_input("Expected rent ($/mo)", 1000, 10000, default_rent, step=50)
-    tax_rate = c8.number_input("Property tax rate", 0.005, 0.025, default_tax,
-                               step=0.0005, format="%.4f")
-    hoa_mo = c9.number_input("HOA ($/mo)", 0, 1000, int(fetched.get("hoa_mo") or 0), step=10)
+    rent_mo = c7.number_input("Expected rent ($/mo)", 200, 30_000, default_rent, step=50)
+    tax_rate = c8.number_input("Property tax rate", 0.001, 0.035, default_tax,
+                               step=0.0005, format="%.4f",
+                               help="State default shown — override for your county/city.")
+    hoa_mo = c9.number_input("HOA ($/mo)", 0, 2000, int(fetched.get("hoa_mo") or 0), step=10)
 
-    if sub_row is not None:
-        st.caption(
-            f"📍 {sub_row['area']} ({sub_row['county']} County, "
-            f"{sub_row['distance_mi_from_20901']}mi from 20901) — "
-            f"median SFH ${int(sub_row['median_sfh_price']):,}, "
-            f"median 3BR rent ${int(sub_row['est_3br_sfh_rent']):,}"
-        )
-    else:
-        st.caption("📍 Zip not in DC Metro reference dataset — enter rent and tax rate manually.")
+    insurance_yr = st.number_input(
+        "Annual insurance ($)", 300, 10_000, default_insurance, step=100,
+        help="State average shown — override for coastal/wildfire/etc. specifics.",
+    )
+
+    a = Assumptions(
+        down_pct=down,
+        mortgage_rate=rate,
+        loan_years=loan_years,
+        insurance_yr=insurance_yr,
+        vacancy_pct=vacancy,
+        maintenance_pct=maint,
+        mgmt_pct=mgmt,
+        appreciation=appreciation,
+        rent_growth=rent_growth,
+    )
 
     m = analyze(price, rent_mo, tax_rate, a, hoa_mo=hoa_mo)
     label, color = verdict(m)
@@ -224,7 +250,8 @@ with tab_eval:
     if st.button("💾 Save to portfolio", type="primary"):
         add_to_portfolio({
             "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "address": address, "zip": zip_code, "price": price, "rent_mo": rent_mo,
+            "address": address, "state": state_code, "zip": zip_code,
+            "price": price, "rent_mo": rent_mo,
             "beds": beds, "baths": baths, "sqft": sqft,
             "cap_rate_pct": round(m["cap_rate"] * 100, 2),
             "coc_pct": round(m["coc_return"] * 100, 2),
@@ -254,7 +281,7 @@ with tab_portfolio:
                                     type=["csv"], key="pf_upload")
         if uploaded is not None:
             try:
-                df = pd.read_csv(uploaded, dtype={"zip": str})
+                df = pd.read_csv(uploaded, dtype={"zip": str, "state": str})
                 st.session_state.portfolio = df.to_dict("records")
                 st.success(f"Loaded {len(df)} properties.")
                 st.rerun()
@@ -281,33 +308,22 @@ with tab_portfolio:
             st.rerun()
 
 
-# ─── TAB 3: Market reference ─────────────────────────────────────────────────
-with tab_market:
-    st.markdown("### Submarket reference — 26 zips within 20 mi of 20901")
+# ─── TAB 3: State reference ──────────────────────────────────────────────────
+with tab_states:
+    st.markdown("### State property tax + insurance reference")
     st.caption(
-        "Median SFH price × median 3BR rent for each submarket, ranked by your current "
-        "sidebar assumptions. Move the sliders to see how the ranking changes."
+        "Effective property tax rates and average homeowner-insurance premiums by US state. "
+        "These are the defaults the **Evaluate** tab uses when you pick a state. "
+        "Edit `states.csv` to refresh. County/city rates can vary widely — always verify."
     )
 
-    rows = []
-    for _, r in submarkets.iterrows():
-        m = analyze(float(r["median_sfh_price"]), float(r["est_3br_sfh_rent"]),
-                    float(r["property_tax_rate"]), a)
-        rows.append({
-            "Zip": r["zip"],
-            "Area": r["area"],
-            "County": r["county"],
-            "Dist (mi)": r["distance_mi_from_20901"],
-            "Median $": int(r["median_sfh_price"]),
-            "Rent": int(r["est_3br_sfh_rent"]),
-            "Cap %": round(m["cap_rate"] * 100, 2),
-            "CoC %": round(m["coc_return"] * 100, 2),
-            "CF/mo": round(m["monthly_cash_flow"], 0),
-            "5yr IRR %": round(m["irr_approx_5yr"] * 100, 2),
-        })
-    df = pd.DataFrame(rows).sort_values("5yr IRR %", ascending=False)
+    df = states.copy()
+    df["Property tax %"] = (df["property_tax_rate"] * 100).round(2)
+    df["Avg insurance $/yr"] = df["avg_insurance_yr"].astype(int)
+    df = df[["state", "state_name", "Property tax %", "Avg insurance $/yr", "notes"]]
+    df.columns = ["State", "Name", "Property tax %", "Avg insurance $/yr", "Notes"]
+    df = df.sort_values("Property tax %")
     st.dataframe(df, hide_index=True, use_container_width=True)
-    st.caption("⚠️ Data snapshot ~mid-2026. Verify with Redfin/Zillow before acting.")
 
 
 # ─── TAB 4: About ────────────────────────────────────────────────────────────
@@ -315,9 +331,10 @@ with tab_about:
     st.markdown("""
 ### What this is
 
-An ROI calculator for **buy-and-hold single-family rental** investments. Paste a
-listing URL or enter property details, tweak the financing/operating assumptions
-in the sidebar, and see live ROI math.
+An ROI calculator for **buy-and-hold single-family rental** investments anywhere
+in the United States. Paste a listing URL or enter property details, pick your
+state, tweak the financing/operating assumptions in the sidebar, and see live
+ROI math.
 
 ### Glossary
 
@@ -343,22 +360,34 @@ in the sidebar, and see live ROI math.
 - **MARGINAL** — 5-yr IRR > 5%
 - **AVOID** — below all of the above
 
+### How state defaults work
+
+When you pick a state, property tax rate and annual insurance are pre-filled
+from `states.csv` (50 states + DC). These are **starting points** — county/city
+rates and property-specific insurance vary significantly. Always override for
+your actual situation:
+
+- Maryland's state average is 1.09%, but Montgomery County is 0.87% and
+  Prince George's County is 1.15%.
+- Florida and Texas have very high average insurance because of wind/hail/flood
+  risk; inland properties may pay much less.
+
 ### Caveats
 
 - **Rent estimates are approximations.** Verify with Zillow Rental Manager,
   Rentometer, and recent rental comps before bidding.
 - **The URL scraper breaks periodically.** Zillow and Redfin change their HTML
   to deter automated requests. Manual entry always works.
-- **Property tax rates** in the reference dataset apply to *primary residences*
-  in MD. Investment property tax can be ~5-15% higher in some jurisdictions
-  due to lost Homestead credits.
-- **Insurance** uses a generic $1,200/yr default. Get real quotes for actual
-  underwriting decisions.
+- **Property tax rates** in `states.csv` are state-level effective rates for
+  primary residences. Investment property tax can be 5-15% higher in some
+  jurisdictions due to lost homestead credits.
+- **Insurance** uses state averages. Coastal Florida, wildfire-zone California,
+  and tornado-belt states run much higher.
 - **This is not financial advice.** Run any deal past a licensed agent, CPA,
   and inspector before committing.
 """)
 
     st.markdown("---")
     st.caption(
-        "Built with Streamlit. [Source on GitHub](https://github.com/your-username/sfh-roi-analyzer)"
+        "Built with Streamlit. [Source on GitHub](https://github.com/ashenafiwk/sfh-roi-analyzer)"
     )

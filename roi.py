@@ -1,4 +1,4 @@
-"""Pure ROI math — no I/O. Imported by the Streamlit app."""
+"""Pure ROI math — no I/O. Imported by both the CLI and the Streamlit app."""
 
 from dataclasses import dataclass
 
@@ -52,6 +52,7 @@ def analyze(price: float, rent_mo: float, tax_rate: float, a: Assumptions, hoa_m
     gross_rent_multiplier = price / annual_rent
     dscr = noi / debt_service if debt_service else float("inf")
 
+    # 5-year projection
     fv_price = price * (1 + a.appreciation) ** 5
     equity_from_appreciation = fv_price - price
     r_m = a.mortgage_rate / 12
@@ -100,6 +101,7 @@ def analyze(price: float, rent_mo: float, tax_rate: float, a: Assumptions, hoa_m
 
 
 def verdict(m: dict) -> tuple[str, str]:
+    """Return (label, color) for a quick visual verdict."""
     cf = m["monthly_cash_flow"]
     irr = m["irr_approx_5yr"]
     if cf > 0 and irr > 0.10:
