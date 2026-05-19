@@ -19,6 +19,7 @@ import streamlit as st
 
 from roi import Assumptions, analyze, verdict
 from scrapers import parse_listing
+from signals import HistoryEvent, analyze_history, normalize_event, parse_event_date, parse_history_paste
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATES_CSV = os.path.join(SCRIPT_DIR, "states.csv")
@@ -54,6 +55,12 @@ if "portfolio" not in st.session_state:
     st.session_state.portfolio = []
 if "fetched" not in st.session_state:
     st.session_state.fetched = {}
+if "history" not in st.session_state:
+    st.session_state.history = []  # list[HistoryEvent]
+if "price_input" not in st.session_state:
+    st.session_state.price_input = 400_000
+if "asking_price" not in st.session_state:
+    st.session_state.asking_price = None  # what the listing actually asks
 
 
 def add_to_portfolio(row: dict):
@@ -126,13 +133,21 @@ with tab_eval:
                 st.info("Pre-filled what could be extracted — please fill in the rest manually.")
         else:
             st.session_state.fetched = result
+            if result.get("history"):
+                st.session_state.history = result["history"]
+            if result.get("price"):
+                st.session_state.price_input = int(result["price"])
+                st.session_state.asking_price = int(result["price"])
             extras = []
             if result.get("property_type"):
                 extras.append(result["property_type"])
             if result.get("year_built"):
                 extras.append(f"built {int(result['year_built'])}")
             extras_str = f" ({', '.join(extras)})" if extras else ""
-            st.success(f"Loaded: {result.get('address', 'listing')}{extras_str}")
+            msg = f"Loaded: {result.get('address', 'listing')}{extras_str}"
+            if result.get("history"):
+                msg += f" • {len(result['history'])} history events"
+            st.success(msg)
 
     fetched = st.session_state.fetched
 
@@ -163,7 +178,7 @@ with tab_eval:
     address = c1.text_input("Address", value=fetched.get("address", ""))
     zip_code = c2.text_input("Zip code", value=str(fetched.get("zip") or ""), max_chars=5)
     price = c3.number_input("Price ($)", min_value=20_000, max_value=10_000_000,
-                            value=int(fetched.get("price") or 400_000), step=5000)
+                            step=5000, key="price_input")
 
     c4, c5, c6 = st.columns(3)
     beds = c4.number_input("Beds", 1, 10, int(fetched.get("beds") or 3))
@@ -186,6 +201,177 @@ with tab_eval:
         "Annual insurance ($)", 300, 10_000, default_insurance, step=100,
         help="State average shown — override for coastal/wildfire/etc. specifics.",
     )
+
+    # ─── Listing intelligence ────────────────────────────────────────────────
+    st.markdown("### Listing intelligence")
+    st.caption(
+        "How long has it been on market? Did it fail to sell before? "
+        "Listing history reveals seller motivation — and your negotiating leverage."
+    )
+
+    asking = st.session_state.asking_price or price
+
+    intel_tab_view, intel_tab_paste, intel_tab_manual = st.tabs(
+        ["History & signals", "Paste history", "Manual entry"]
+    )
+
+    with intel_tab_paste:
+        st.caption(
+            "On a Redfin/Zillow listing page, scroll to **Property history**, "
+            "select the date+event+price rows, copy, and paste below. The parser "
+            "picks out dates, events, and prices automatically."
+        )
+        paste_text = st.text_area(
+            "Paste property history text",
+            height=180,
+            placeholder=(
+                "Apr 16, 2026   Listed   Redfin   $1,050,000\n"
+                "Dec 11, 2025   Listing removed   Redfin   $1,149,000\n"
+                "Oct 1, 2025    Listed   Redfin   $1,149,000\n"
+                "..."
+            ),
+            key="paste_history_text",
+        )
+        c_parse, c_clear = st.columns([1, 1])
+        if c_parse.button("Parse & use", use_container_width=True):
+            parsed = parse_history_paste(paste_text)
+            if parsed:
+                st.session_state.history = parsed
+                st.success(f"Parsed {len(parsed)} events.")
+                st.rerun()
+            else:
+                st.warning("Couldn't find any date+event+price triples in that text.")
+        if c_clear.button("Clear history", use_container_width=True):
+            st.session_state.history = []
+            st.rerun()
+
+    with intel_tab_manual:
+        st.caption("Edit rows directly. Date format: YYYY-MM-DD. Event: Listed, Listing removed, Sold, Price changed, Pending.")
+        rows = [
+            {"date": e.date.isoformat(), "event": e.raw_event or e.event, "price": e.price or 0}
+            for e in st.session_state.history
+        ] or [{"date": "", "event": "", "price": 0}]
+        edited = st.data_editor(
+            rows,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "date": st.column_config.TextColumn("Date", help="YYYY-MM-DD or 'Apr 16, 2026'"),
+                "event": st.column_config.TextColumn("Event"),
+                "price": st.column_config.NumberColumn("Price", format="$%d"),
+            },
+            key="history_editor",
+        )
+        if st.button("Save manual events", key="save_manual"):
+            new_history: list[HistoryEvent] = []
+            for r in edited:
+                d = parse_event_date(r.get("date"))
+                ev_raw = r.get("event") or ""
+                if d and ev_raw.strip():
+                    new_history.append(HistoryEvent(
+                        event=normalize_event(ev_raw),
+                        date=d,
+                        price=float(r["price"]) if r.get("price") else None,
+                        raw_event=ev_raw,
+                        source="manual",
+                    ))
+            st.session_state.history = new_history
+            st.success(f"Saved {len(new_history)} events.")
+            st.rerun()
+
+    with intel_tab_view:
+        history = st.session_state.history
+        if not history:
+            st.info(
+                "No listing history yet. Either fetch a URL (auto-scrape), or use the "
+                "**Paste history** / **Manual entry** tabs to add events."
+            )
+        else:
+            sig = analyze_history(history, current_price=asking)
+
+            # ── Leverage badge + headline numbers ────────────────────────────
+            st.markdown(f"**Leverage:** :{sig.leverage_color}[{sig.leverage_label}]")
+
+            hc1, hc2, hc3, hc4 = st.columns(4)
+            hc1.metric(
+                "Days on market",
+                f"{sig.days_on_market}" if sig.days_on_market is not None else "—",
+            )
+            hc2.metric(
+                "Cuts (current)",
+                f"{sig.cuts_current_run}",
+            )
+            hc3.metric(
+                "Prior failed",
+                f"{sig.prior_failed_attempts}",
+                help="Times this property was listed in the past and removed without selling.",
+            )
+            hc4.metric(
+                "Long-term appr.",
+                f"{sig.long_term_appreciation_pct:.1f}%/yr" if sig.long_term_appreciation_pct is not None else "—",
+                help="Annualized appreciation since the last recorded sale.",
+            )
+
+            # ── Flag bullets ──────────────────────────────────────────────────
+            if sig.flags_red:
+                st.markdown("**:red[🚩 Red flags]**")
+                for f in sig.flags_red:
+                    st.markdown(f"- {f}")
+            if sig.flags_yellow:
+                st.markdown("**:orange[⚠️ Yellow flags]**")
+                for f in sig.flags_yellow:
+                    st.markdown(f"- {f}")
+            if sig.flags_green:
+                st.markdown("**:green[✅ Supporting context]**")
+                for f in sig.flags_green:
+                    st.markdown(f"- {f}")
+
+            # ── Recommended offer ─────────────────────────────────────────────
+            if sig.recommended_offer_low and sig.recommended_offer_high:
+                off_low = sig.recommended_offer_low
+                off_high = sig.recommended_offer_high
+                off_mid = round((off_low + off_high) / 2 / 1000) * 1000
+                pct_off = (asking - off_mid) / asking * 100 if asking else 0
+                st.markdown("---")
+                oc1, oc2 = st.columns([3, 2])
+                with oc1:
+                    st.markdown(
+                        f"**Recommended offer band:** ${off_low:,.0f} – ${off_high:,.0f}  \n"
+                        f"_(midpoint ~${off_mid:,.0f}, about {pct_off:.1f}% off ${asking:,.0f} ask)_"
+                    )
+                with oc2:
+                    if st.button(
+                        f"Use ${off_mid:,.0f} as offer price",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        st.session_state.price_input = int(off_mid)
+                        st.rerun()
+
+            # ── Events table ──────────────────────────────────────────────────
+            with st.expander(f"Events ({len(history)})", expanded=False):
+                ev_df = pd.DataFrame([
+                    {
+                        "Date": e.date.isoformat(),
+                        "Event": e.raw_event or e.event,
+                        "Price": f"${e.price:,.0f}" if e.price else "—",
+                        "Source": e.source,
+                    }
+                    for e in sorted(history, key=lambda x: x.date, reverse=True)
+                ])
+                st.dataframe(ev_df, hide_index=True, use_container_width=True)
+
+    # ── If user has shifted price away from ask, show a side-by-side compare ─
+    if (
+        st.session_state.asking_price
+        and price != st.session_state.asking_price
+        and abs(price - st.session_state.asking_price) > 1000
+    ):
+        st.info(
+            f"📊 Modeling at **${price:,.0f}** — listing asks **${st.session_state.asking_price:,.0f}** "
+            f"({(st.session_state.asking_price - price) / st.session_state.asking_price * 100:+.1f}%). "
+            "Results below reflect the offer price, not the ask."
+        )
 
     a = Assumptions(
         down_pct=down,
@@ -248,7 +434,10 @@ with tab_eval:
         )
 
     if st.button("💾 Save to portfolio", type="primary"):
-        add_to_portfolio({
+        # Re-compute listing signals so the snapshot is consistent.
+        sig_save = analyze_history(st.session_state.history, current_price=price) \
+            if st.session_state.history else None
+        row = {
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "address": address, "state": state_code, "zip": zip_code,
             "price": price, "rent_mo": rent_mo,
@@ -260,8 +449,15 @@ with tab_eval:
             "rate_used_pct": round(rate * 100, 2),
             "down_pct_used": round(down * 100, 1),
             "verdict": label,
+            "asking_price": st.session_state.asking_price or price,
+            "leverage": sig_save.leverage_label if sig_save else "",
+            "days_on_market": sig_save.days_on_market if sig_save else "",
+            "prior_failed": sig_save.prior_failed_attempts if sig_save else "",
+            "rec_offer_low": sig_save.recommended_offer_low if sig_save else "",
+            "rec_offer_high": sig_save.recommended_offer_high if sig_save else "",
             "source_url": url,
-        })
+        }
+        add_to_portfolio(row)
         st.success("Saved to portfolio (in-session).")
 
 
@@ -359,6 +555,46 @@ ROI math.
 - **HOLD (appreciation play)** — 5-yr IRR > 8% (you bleed cash but build equity)
 - **MARGINAL** — 5-yr IRR > 5%
 - **AVOID** — below all of the above
+
+### Listing intelligence
+
+The asking price is one number — what's behind it is several. The Listing
+intelligence section reads the property's history (auto-scraped, pasted, or
+manually entered) and surfaces:
+
+- **Days on market** in the current run
+- **Cuts** the seller has already publicly accepted
+- **Prior failed attempts** — times this house was listed and withdrawn
+- **Prior high-water ask** — what the market already rejected
+- **Long-term appreciation** since the last actual sale
+- **Red / yellow / green flags** — human-readable signals
+- **Recommended offer band** — $low–$high range with a button to re-run the ROI math at that price
+
+#### Leverage labels
+
+- **STRONG LEVERAGE** — heavy seller motivation (≥ 5% recommended discount)
+- **MILD LEVERAGE** — moderate motivation (2.5–5%)
+- **SOME LEVERAGE** — light motivation (< 2.5%)
+- **HOT LISTING — pay near ask** — fresh, no history of cuts/failures
+- **NO HISTORY** — feed history events to enable this section
+
+#### Discount heuristic (capped at 10%)
+
+| Signal | Stacked discount |
+| --- | --- |
+| 14–30 days on market | +1.0% |
+| 31–60 days | +2.5% |
+| 61–90 days | +4.5% |
+| 91–120 days | +6.0% |
+| > 120 days | +7.0% |
+| Prior failed attempt | +2.0% |
+| ≥ 2 prior failed attempts | +1.0% |
+| 1 price cut, current run | +1.0% |
+| 2+ price cuts, current run | +2.0% |
+| > 5% off prior unsold high-water ask | +1.0% |
+
+The output is a ±1%-wide band around `current_price × (1 − discount)`, rounded
+to the nearest $1K.
 
 ### How state defaults work
 

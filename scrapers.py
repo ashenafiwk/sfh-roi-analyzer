@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
+from signals import HistoryEvent, normalize_event, parse_event_date, parse_price
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -111,6 +113,133 @@ def _parse_jsonld_all(html: str) -> dict:
     return out
 
 
+# ─── Listing-history extraction ──────────────────────────────────────────────
+
+# Keys that have been observed on Redfin/Zillow event objects. We accept the
+# union — different sources expose different field names for the same thing.
+_HISTORY_EVENT_KEYS = {"event", "eventDescription", "priceEvent"}
+_HISTORY_DATE_KEYS = {"eventDate", "date", "time", "eventDateMillis"}
+_HISTORY_PRICE_KEYS = {"price", "eventPrice", "amount"}
+
+
+def _looks_like_history_event(d: dict) -> bool:
+    keys = set(d.keys())
+    return bool(keys & _HISTORY_EVENT_KEYS) and bool(keys & _HISTORY_DATE_KEYS)
+
+
+def _coerce_event(d: dict, source: str) -> HistoryEvent | None:
+    raw_event = next((d[k] for k in _HISTORY_EVENT_KEYS if k in d and d[k]), None)
+    raw_date = next((d[k] for k in _HISTORY_DATE_KEYS if k in d and d[k] is not None), None)
+    raw_price = next((d[k] for k in _HISTORY_PRICE_KEYS if k in d and d[k] is not None), None)
+    if not raw_event or raw_date is None:
+        return None
+    if isinstance(raw_event, dict):
+        raw_event = raw_event.get("text") or raw_event.get("name") or ""
+    parsed_date = parse_event_date(raw_date)
+    if parsed_date is None:
+        return None
+    return HistoryEvent(
+        event=normalize_event(str(raw_event)),
+        date=parsed_date,
+        price=parse_price(raw_price),
+        raw_event=str(raw_event),
+        source=source,
+    )
+
+
+def _walk_for_history(node: Any, out: list, source: str, seen: set):
+    """Recursively collect any dict that looks like a history event."""
+    if isinstance(node, dict):
+        if _looks_like_history_event(node):
+            ev = _coerce_event(node, source)
+            if ev:
+                # Dedupe by (date, event, price) — sites sometimes repeat.
+                key = (ev.date.isoformat(), ev.event, ev.price)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(ev)
+        for v in node.values():
+            _walk_for_history(v, out, source, seen)
+    elif isinstance(node, list):
+        for v in node:
+            _walk_for_history(v, out, source, seen)
+
+
+def _scripts_containing(html: str, *needles: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    blobs: list[str] = []
+    for tag in soup.find_all("script"):
+        text = tag.string or "".join(tag.strings)
+        if not text:
+            continue
+        if any(n in text for n in needles):
+            blobs.append(text)
+    return blobs
+
+
+def _iter_json_objects(text: str):
+    """Yield JSON objects/arrays embedded in arbitrary JS text.
+
+    Brace-matches with string-awareness so we correctly skip `}` characters
+    that appear inside quoted strings.
+    """
+    n = len(text)
+    i = 0
+    while i < n:
+        c = text[i]
+        if c not in "{[":
+            i += 1
+            continue
+        opener = c
+        closer = "}" if opener == "{" else "]"
+        depth = 0
+        in_str = False
+        esc = False
+        j = i
+        while j < n:
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        yield json.loads(text[i : j + 1])
+                    except Exception:
+                        pass
+                    i = j + 1
+                    break
+            j += 1
+        else:
+            return
+
+
+def extract_history(html: str, source: str, needles: tuple[str, ...]) -> list[HistoryEvent]:
+    out: list[HistoryEvent] = []
+    seen: set = set()
+    for blob in _scripts_containing(html, *needles):
+        # Fast path — script is pure JSON.
+        try:
+            _walk_for_history(json.loads(blob.strip()), out, source, seen)
+            continue
+        except Exception:
+            pass
+        # Embedded JSON inside JS assignments.
+        for obj in _iter_json_objects(blob):
+            _walk_for_history(obj, out, source, seen)
+    out.sort(key=lambda e: e.date)
+    return out
+
+
 # ─── Site-specific scrapers ──────────────────────────────────────────────────
 
 def parse_redfin(html: str) -> dict:
@@ -131,6 +260,14 @@ def parse_redfin(html: str) -> dict:
     m = re.search(r'"hoaDues":\s*(\d+)', html)
     if m:
         out["hoa_mo"] = int(m.group(1))
+
+    history = extract_history(
+        html,
+        source="redfin",
+        needles=("eventDescription", "propertyHistory", "priceHistory"),
+    )
+    if history:
+        out["history"] = history
 
     out["zip"] = _zip_from_address(out.get("address", ""))
     return _clean(out)
@@ -158,6 +295,14 @@ def parse_zillow(html: str) -> dict:
         title = soup.find("title")
         if title:
             out["address"] = title.text.split(" | ")[0].strip()
+
+    history = extract_history(
+        html,
+        source="zillow",
+        needles=("priceHistory", "eventDescription"),
+    )
+    if history:
+        out["history"] = history
 
     out["zip"] = _zip_from_address(out.get("address", ""))
     return _clean(out)

@@ -5,6 +5,7 @@ A Streamlit web app that does buy-and-hold rental investment math for **Single F
 ## Features
 
 - 📋 **Paste a listing URL** → auto-fills price, beds, baths, sqft, address, zip from Zillow or Redfin (and pulls Zestimate rent when available)
+- 🕵️ **Listing intelligence** — scrapes (or accepts pasted) property history, then surfaces days on market, prior failed listings, price cuts, long-term appreciation, red/yellow/green flags, and a **recommended offer band** based on seller motivation
 - 🇺🇸 **State dropdown** → pre-fills property tax rate and average insurance for all 50 states + DC
 - 🎚️ **Sidebar sliders** for mortgage rate, down %, vacancy, mgmt fee, maintenance, appreciation
 - 📊 **Live ROI metrics** — cap rate, cash-on-cash, monthly CF, 5-yr IRR, 1% rule, GRM, DSCR
@@ -48,7 +49,8 @@ No secrets or environment variables needed — everything works out of the box. 
 sfh-roi-analyzer/
 ├── app.py              Streamlit UI (entry point)
 ├── roi.py              ROI math — Assumptions, analyze(), verdict()
-├── scrapers.py         Zillow / Redfin URL parsers (JSON-LD walker)
+├── signals.py          Listing-history analysis — flags + recommended offer
+├── scrapers.py         Zillow / Redfin URL + history parsers (JSON walker)
 ├── states.csv          Per-state property tax + avg insurance defaults (50 + DC)
 ├── roi_analyzer.py     CLI for bulk-analyzing a properties.csv
 ├── requirements.txt    Python dependencies
@@ -83,6 +85,51 @@ Verdict thresholds (in `roi.py:verdict()`):
 - **HOLD (appreciation play)** — 5-yr IRR > 8%
 - **MARGINAL** — 5-yr IRR > 5%
 - **AVOID** — below all of the above
+
+## Listing intelligence
+
+The asking price is one number. What's behind it is several:
+
+- How long has the property been on market?
+- Has the seller cut the price in the current run?
+- Did it fail to sell before — listed, then withdrawn?
+- What's the long-term appreciation since the last actual sale?
+
+These shape your negotiating leverage. A fresh listing in week 1 isn't the same deal as a relist that already failed at a higher number and is sitting at month 4. `signals.py:analyze_history()` takes the property history and returns:
+
+- **Leverage label** — `STRONG LEVERAGE` / `MILD LEVERAGE` / `SOME LEVERAGE` / `HOT LISTING — pay near ask`
+- **Days on market** in the current run
+- **Cuts in current run**, original ask, % off
+- **Prior failed attempts** (listed → withdrawn without selling)
+- **Prior high-water ask** — the highest unsold ask from the most recent failed cycle
+- **Long-term appreciation %/yr** since the last recorded sale
+- **Red / yellow / green flags** — human-readable signals
+- **Recommended offer band** — a rounded $low–$high range, with a midpoint button that re-runs the ROI math at the recommended offer
+
+### How to feed it data
+
+1. **Auto-scrape**: paste a Zillow/Redfin URL, click Fetch. The history extractor walks all embedded JSON blobs looking for property-history events (resilient to most HTML rearrangement, but not guaranteed).
+2. **Paste**: copy the Property History block from the listing page and paste it into the **Paste history** tab. The parser tokenizes dates, event keywords, and prices in document-order — handles the various ways Redfin/Zillow lay out their history rows.
+3. **Manual entry**: type rows directly in the **Manual entry** tab.
+
+### Discount heuristic
+
+The recommended-offer discount stacks contributions:
+
+| Signal | Discount |
+| --- | --- |
+| 14–30 days on market | +1.0% |
+| 31–60 days | +2.5% |
+| 61–90 days | +4.5% |
+| 91–120 days | +6.0% |
+| > 120 days | +7.0% |
+| Prior failed attempt | +2.0% |
+| Multiple prior failed attempts | +1.0% |
+| 1 price cut current run | +1.0% |
+| 2+ price cuts current run | +2.0% |
+| Already > 5% off a prior unsold high-water ask | +1.0% |
+
+Capped at 10% total. The output is a ±1%-wide band around `current_price × (1 − discount)`, rounded to the nearest $1K. Below 2.5% total, the verdict is `HOT LISTING` and the band tightens to a 0–2% discount.
 
 ## Bulk analysis from CSV (CLI)
 
