@@ -24,6 +24,11 @@ from signals import HistoryEvent, analyze_history, normalize_event, parse_event_
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATES_CSV = os.path.join(SCRIPT_DIR, "states.csv")
 
+# Example default for the "Your search area" sidebar input. Change this for
+# your fork, or just override it in the UI at runtime — it's only the
+# pre-filled value, not a hard-coded restriction.
+DEFAULT_TARGET_ZIPS = "20901"
+
 st.set_page_config(page_title="SFH ROI Analyzer", page_icon="🏠", layout="wide")
 
 
@@ -48,6 +53,18 @@ def state_from_address(addr: str) -> str | None:
     if m and m.group(1) in STATES_BY_CODE:
         return m.group(1)
     return None
+
+
+def zip_match(zip_code: str, targets: set[str]) -> str:
+    """Return 'exact' (in target list), 'region' (same 3-digit zip prefix as
+    any target — same metro/sub-metro), or 'out' (no match)."""
+    if not zip_code or not targets:
+        return "out"
+    if zip_code in targets:
+        return "exact"
+    if any(t[:3] == zip_code[:3] for t in targets if len(t) >= 3):
+        return "region"
+    return "out"
 
 
 # ─── Session state initialization ────────────────────────────────────────────
@@ -91,6 +108,20 @@ with st.sidebar.expander("💡 Scenario tips"):
         "**All cash?** Set down to 50%+ — cash-on-cash converges to cap rate.\n\n"
         "**Self-manage?** Set property mgmt to 0%."
     )
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Your search area")
+target_zips_raw = st.sidebar.text_input(
+    "Target zip code(s)",
+    value=DEFAULT_TARGET_ZIPS,
+    help=(
+        "Comma-separate multiple zips, e.g. '20901, 20902, 20906'. "
+        "Properties in this list get an 'in your search area' badge; "
+        "everything else is flagged. Edit `DEFAULT_TARGET_ZIPS` in `app.py` "
+        "to change the public default for your fork."
+    ),
+)
+target_zips = {z.strip() for z in target_zips_raw.split(",") if z.strip().isdigit()}
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -179,6 +210,23 @@ with tab_eval:
     zip_code = c2.text_input("Zip code", value=str(fetched.get("zip") or ""), max_chars=5)
     price = c3.number_input("Price ($)", min_value=20_000, max_value=10_000_000,
                             step=5000, key="price_input")
+
+    # ─── Search-area badge ───────────────────────────────────────────────────
+    if zip_code and target_zips:
+        match = zip_match(zip_code, target_zips)
+        target_str = ", ".join(sorted(target_zips))
+        if match == "exact":
+            st.success(f"📍 **{zip_code}** is in your target area ({target_str}).")
+        elif match == "region":
+            st.info(
+                f"📍 **{zip_code}** shares a region (zip3 = {zip_code[:3]}) with your "
+                f"target area but isn't in your exact list ({target_str})."
+            )
+        else:
+            st.warning(
+                f"⚠️ **{zip_code}** is outside your target area ({target_str}). "
+                "Worth evaluating only if it's clearly a better deal."
+            )
 
     c4, c5, c6 = st.columns(3)
     beds = c4.number_input("Beds", 1, 10, int(fetched.get("beds") or 3))
@@ -440,6 +488,7 @@ with tab_eval:
         row = {
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "address": address, "state": state_code, "zip": zip_code,
+            "in_target_area": zip_match(zip_code, target_zips),
             "price": price, "rent_mo": rent_mo,
             "beds": beds, "baths": baths, "sqft": sqft,
             "cap_rate_pct": round(m["cap_rate"] * 100, 2),

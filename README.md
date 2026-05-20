@@ -6,6 +6,7 @@ A Streamlit web app that does buy-and-hold rental investment math for **Single F
 
 - 📋 **Paste a listing URL** → auto-fills price, beds, baths, sqft, address, zip from Zillow or Redfin (and pulls Zestimate rent when available)
 - 🕵️ **Listing intelligence** — scrapes (or accepts pasted) property history, then surfaces days on market, prior failed listings, price cuts, long-term appreciation, red/yellow/green flags, and a **recommended offer band** based on seller motivation
+- 📍 **Your search area** — set one or more target zip codes in the sidebar; properties are tagged `in target area`, `same region (zip3 match)`, or `outside`. Defaults to `20901` (Silver Spring, MD) — change `DEFAULT_TARGET_ZIPS` near the top of `app.py` to set a different default for your fork, or just edit the value in the UI.
 - 🇺🇸 **State dropdown** → pre-fills property tax rate and average insurance for all 50 states + DC
 - 🎚️ **Sidebar sliders** for mortgage rate, down %, vacancy, mgmt fee, maintenance, appreciation
 - 📊 **Live ROI metrics** — cap rate, cash-on-cash, monthly CF, 5-yr IRR, 1% rule, GRM, DSCR
