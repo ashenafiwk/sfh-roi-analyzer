@@ -17,7 +17,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from roi import Assumptions, analyze, verdict
+from roi import Assumptions, SCENARIOS, analyze, analyze_scenarios, verdict
 from scrapers import parse_listing
 from signals import HistoryEvent, analyze_history, normalize_event, parse_event_date, parse_history_paste
 
@@ -457,7 +457,8 @@ with tab_eval:
     with st.expander("Monthly breakdown"):
         breakdown = pd.DataFrame({
             "Item": ["Gross rent", "Vacancy loss", "Property tax", "Insurance",
-                     "Maintenance", "Property mgmt", "HOA", "Mortgage P&I", "= Cash flow"],
+                     "Maintenance", "Property mgmt", "HOA", "Mortgage P&I", "PMI",
+                     "= Cash flow"],
             "Amount/mo": [
                 f"${rent_mo:,.0f}",
                 f"-${rent_mo * vacancy:,.0f}",
@@ -467,6 +468,7 @@ with tab_eval:
                 f"-${m['monthly_mgmt']:,.0f}",
                 f"-${m['monthly_hoa']:,.0f}",
                 f"-${m['monthly_pi']:,.0f}",
+                f"-${m['monthly_pmi']:,.0f}",
                 f"${m['monthly_cash_flow']:,.0f}",
             ],
         })
@@ -479,6 +481,69 @@ with tab_eval:
             f"- **Principal paid down:** ${m['principal_paid_5yr']:,.0f}\n"
             f"- **Cumulative cash flow (5yr):** ${m['cum_cf_5yr']:,.0f}\n"
             f"- **Total return:** ${m['total_return_5yr']:,.0f} on ${m['cash_in']:,.0f} cash in"
+        )
+
+    # ─── Compare financing strategies ────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Compare financing strategies")
+    st.caption(
+        "Same property, same operating assumptions — three different financing paths. "
+        "Sidebar sliders still drive vacancy / maintenance / mgmt / appreciation; only "
+        "down payment, rate, PMI, and occupancy switch per scenario."
+    )
+
+    scen_results = analyze_scenarios(price, rent_mo, tax_rate, a, hoa_mo=hoa_mo)
+    scen_cols = st.columns(len(scen_results))
+
+    for col, (name, sm) in zip(scen_cols, scen_results.items()):
+        with col:
+            st.markdown(f"**{name}**")
+            st.caption(
+                f"{sm['down_pct_used']*100:.0f}% down @ {sm['rate_used']*100:.2f}% • "
+                + (f"PMI {sm['pmi_pct_used']*100:.2f}%" if sm['pmi_pct_used'] > 0 else "no PMI")
+                + (f" • yr1 owner-occ" if sm['owner_occupy_years_used'] > 0 else "")
+            )
+
+            # Color the CF and IRR rows by sign / threshold.
+            cf = sm["monthly_cash_flow"]
+            cf_color = "green" if cf >= 0 else ("orange" if cf > -300 else "red")
+            irr = sm["irr_approx_5yr"] * 100
+            irr_color = "green" if irr >= 10 else ("orange" if irr >= 5 else "red")
+
+            st.markdown(f"- Cash needed: **${sm['cash_in']:,.0f}**")
+            st.markdown(f"- Monthly CF (rented): :{cf_color}[**${cf:,.0f}**]")
+            st.markdown(f"- 5-yr IRR: :{irr_color}[**{irr:.1f}%**]")
+            st.markdown(f"- Cash-on-cash: **{sm['coc_return']*100:.1f}%**")
+            st.markdown(f"- DSCR: **{sm['dscr']:.2f}**")
+            st.markdown(f"- Break-even rent: **${sm['breakeven_rent_mo']:,.0f}/mo**")
+            if sm["owner_occupy_years_used"] > 0:
+                st.markdown(
+                    f"- Yr-1 carry (you live there): "
+                    f":red[**-${sm['monthly_carry_owner_occupied']:,.0f}/mo**]"
+                )
+
+            badge = {
+                "Primary residence (5% down)": ":red[⚠️ occupancy rules apply]",
+                "Live-in BRRRR (yr1 owner-occ)": ":green[✅ legally clean path]",
+                "Investment loan (25% down)": ":green[✅ rental day-one OK]",
+            }.get(name, "")
+            if badge:
+                st.markdown(badge)
+            st.caption(sm["caveat"])
+
+    # Quick "what rent gap am I staring at?" summary across scenarios.
+    gaps = [(n, sm["breakeven_rent_mo"] - rent_mo) for n, sm in scen_results.items()]
+    best_name, best_gap = min(gaps, key=lambda x: x[1])
+    if best_gap > 0:
+        st.info(
+            f"📉 At **${rent_mo:,.0f}/mo** rent, every scenario is short of break-even. "
+            f"Smallest gap is **{best_name}** at **${best_gap:,.0f}/mo short**. "
+            f"To turn any of these cash-flow positive you need either a lower price, "
+            f"a higher achievable rent, or a different financing structure."
+        )
+    elif best_gap <= 0:
+        st.success(
+            f"✅ **{best_name}** clears break-even at ${rent_mo:,.0f}/mo rent."
         )
 
     if st.button("💾 Save to portfolio", type="primary"):
