@@ -277,27 +277,8 @@ def portfolio_df() -> pd.DataFrame:
     return pd.DataFrame(st.session_state.portfolio)
 
 
-# ─── Sidebar: Assumptions ────────────────────────────────────────────────────
-st.sidebar.header("Assumptions")
-rate = st.sidebar.slider("Mortgage rate (%)", 3.0, 12.0, 7.25, 0.05) / 100
-down = st.sidebar.slider("Down payment (%)", 3, 50, 20, 1) / 100
-vacancy = st.sidebar.slider("Vacancy (%)", 0, 15, 6, 1) / 100
-mgmt = st.sidebar.slider("Property mgmt (% of rent)", 0, 12, 8, 1) / 100
-maint = st.sidebar.slider("Maintenance (% of rent)", 0, 15, 8, 1) / 100
-appreciation = st.sidebar.slider("Long-run appreciation (%)", 0.0, 8.0, 3.5, 0.5) / 100
-rent_growth = st.sidebar.slider("Long-run rent growth (%)", 0.0, 8.0, 3.0, 0.5) / 100
-loan_years = st.sidebar.selectbox("Loan term (years)", [15, 20, 30], index=2)
-
-with st.sidebar.expander("💡 Scenario tips"):
-    st.markdown(
-        "**Refi later?** Drop the rate slider by 1-2 points to model a refinance.\n\n"
-        "**House hack?** Set down to 5% (FHA owner-occupant). Use room-rental totals as rent.\n\n"
-        "**All cash?** Set down to 50%+ — cash-on-cash converges to cap rate.\n\n"
-        "**Self-manage?** Set property mgmt to 0%."
-    )
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Your search area (optional)")
+# ─── Sidebar: Search area ────────────────────────────────────────────────────
+st.sidebar.header("Your search area (optional)")
 target_zips_raw = st.sidebar.text_input(
     "Target zip code(s)",
     value=DEFAULT_TARGET_ZIPS,
@@ -317,6 +298,27 @@ target_radius = st.sidebar.slider(
         "'in radius' badge. Set to 0 to require an exact zip match."
     ),
 )
+
+st.sidebar.markdown("---")
+
+# ─── Sidebar: Assumptions ────────────────────────────────────────────────────
+st.sidebar.header("Assumptions")
+rate = st.sidebar.slider("Mortgage rate (%)", 3.0, 12.0, 7.25, 0.05) / 100
+down = st.sidebar.slider("Down payment (%)", 3, 50, 20, 1) / 100
+vacancy = st.sidebar.slider("Vacancy (%)", 0, 15, 6, 1) / 100
+mgmt = st.sidebar.slider("Property mgmt (% of rent)", 0, 12, 8, 1) / 100
+maint = st.sidebar.slider("Maintenance (% of rent)", 0, 15, 8, 1) / 100
+appreciation = st.sidebar.slider("Long-run appreciation (%)", 0.0, 8.0, 3.5, 0.5) / 100
+rent_growth = st.sidebar.slider("Long-run rent growth (%)", 0.0, 8.0, 3.0, 0.5) / 100
+loan_years = st.sidebar.selectbox("Loan term (years)", [15, 20, 30], index=2)
+
+with st.sidebar.expander("💡 Scenario tips"):
+    st.markdown(
+        "**Refi later?** Drop the rate slider by 1-2 points to model a refinance.\n\n"
+        "**House hack?** Set down to 5% (FHA owner-occupant). Use room-rental totals as rent.\n\n"
+        "**All cash?** Set down to 50%+ — cash-on-cash converges to cap rate.\n\n"
+        "**Self-manage?** Set property mgmt to 0%."
+    )
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
