@@ -11,6 +11,7 @@ Run locally:
 
 import concurrent.futures
 import io
+import math
 import os
 import re
 from datetime import datetime
@@ -25,10 +26,11 @@ from signals import HistoryEvent, analyze_history, normalize_event, parse_event_
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATES_CSV = os.path.join(SCRIPT_DIR, "states.csv")
 
-# Example default for the "Your search area" sidebar input. Change this for
-# your fork, or just override it in the UI at runtime — it's only the
-# pre-filled value, not a hard-coded restriction.
-DEFAULT_TARGET_ZIPS = "20901"
+# Empty by default — users opt in to area filtering by typing one or more zips.
+# This keeps the app friendly for anyone, anywhere; without a target, no badge
+# is shown.
+DEFAULT_TARGET_ZIPS = ""
+DEFAULT_RADIUS_MILES = 25
 
 st.set_page_config(page_title="SFH ROI Analyzer", page_icon="🏠", layout="wide")
 
@@ -56,16 +58,87 @@ def state_from_address(addr: str) -> str | None:
     return None
 
 
-def zip_match(zip_code: str, targets: set[str]) -> str:
-    """Return 'exact' (in target list), 'region' (same 3-digit zip prefix as
-    any target — same metro/sub-metro), or 'out' (no match)."""
+@st.cache_resource(show_spinner=False)
+def _zip_geocoder():
+    """Lazy-load pgeocode US zip→lat/lon. Cached across reruns. Returns None
+    if pgeocode isn't installed or its data download fails — callers degrade
+    gracefully via the 'unknown' match state."""
+    try:
+        import pgeocode
+        return pgeocode.Nominatim("us")
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def _zip_to_latlon(zip_code: str) -> tuple[float, float] | None:
+    """Look up (lat, lon) for a US zip. Returns None if missing or geocoder
+    unavailable. Cached per zip — first call per session may take a moment
+    while pgeocode warms up; subsequent calls are instant."""
+    nomi = _zip_geocoder()
+    if nomi is None or not zip_code or not zip_code.isdigit() or len(zip_code) != 5:
+        return None
+    try:
+        rec = nomi.query_postal_code(zip_code)
+    except Exception:
+        return None
+    lat = getattr(rec, "latitude", None)
+    lon = getattr(rec, "longitude", None)
+    if lat is None or lon is None or pd.isna(lat) or pd.isna(lon):
+        return None
+    return (float(lat), float(lon))
+
+
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in miles between two lat/lon points."""
+    R = 3958.7613  # earth radius in miles
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    )
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def zip_match(
+    zip_code: str, targets: set[str], radius_miles: float
+) -> tuple[str, str | None, float | None]:
+    """
+    Classify a zip relative to the user's target zips.
+
+    Returns (state, nearest_target_zip, distance_miles):
+      - 'exact'     — zip is in the target list
+      - 'in_radius' — within radius_miles of nearest target
+      - 'out'       — geocoded fine, but no target is close enough
+      - 'unknown'   — zip lookup failed (offline, bad zip, etc.) — no judgment
+    """
     if not zip_code or not targets:
-        return "out"
+        return ("out", None, None)
     if zip_code in targets:
-        return "exact"
-    if any(t[:3] == zip_code[:3] for t in targets if len(t) >= 3):
-        return "region"
-    return "out"
+        return ("exact", zip_code, 0.0)
+    src = _zip_to_latlon(zip_code)
+    if src is None:
+        return ("unknown", None, None)
+
+    nearest = None
+    nearest_d = math.inf
+    any_target_ok = False
+    for t in targets:
+        dst = _zip_to_latlon(t)
+        if dst is None:
+            continue
+        any_target_ok = True
+        d = _haversine_miles(src[0], src[1], dst[0], dst[1])
+        if d < nearest_d:
+            nearest_d = d
+            nearest = t
+
+    if not any_target_ok:
+        return ("unknown", None, None)
+
+    state = "in_radius" if nearest_d <= radius_miles else "out"
+    return (state, nearest, nearest_d)
 
 
 # ─── Session state initialization ────────────────────────────────────────────
@@ -224,18 +297,26 @@ with st.sidebar.expander("💡 Scenario tips"):
     )
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Your search area")
+st.sidebar.subheader("Your search area (optional)")
 target_zips_raw = st.sidebar.text_input(
     "Target zip code(s)",
     value=DEFAULT_TARGET_ZIPS,
+    placeholder="e.g. 20901, 22102",
     help=(
-        "Comma-separate multiple zips, e.g. '20901, 20902, 20906'. "
-        "Properties in this list get an 'in your search area' badge; "
-        "everything else is flagged. Edit `DEFAULT_TARGET_ZIPS` in `app.py` "
-        "to change the public default for your fork."
+        "Comma-separate one or more US zips. Properties within your radius "
+        "get an 'in radius' badge; everything else is informational, not "
+        "blocked. Leave empty to skip area filtering entirely."
     ),
 )
 target_zips = {z.strip() for z in target_zips_raw.split(",") if z.strip().isdigit()}
+target_radius = st.sidebar.slider(
+    "Search radius (miles)",
+    min_value=0, max_value=200, value=DEFAULT_RADIUS_MILES, step=5,
+    help=(
+        "Properties within this many miles of any target zip get the "
+        "'in radius' badge. Set to 0 to require an exact zip match."
+    ),
+)
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -327,20 +408,27 @@ with tab_eval:
 
     # ─── Search-area badge ───────────────────────────────────────────────────
     if zip_code and target_zips:
-        match = zip_match(zip_code, target_zips)
-        target_str = ", ".join(sorted(target_zips))
-        if match == "exact":
-            st.success(f"📍 **{zip_code}** is in your target area ({target_str}).")
-        elif match == "region":
+        state, nearest, dist = zip_match(zip_code, target_zips, target_radius)
+        if state == "exact":
+            target_str = ", ".join(sorted(target_zips))
+            st.success(f"📍 **{zip_code}** is in your search area ({target_str}).")
+        elif state == "in_radius":
             st.info(
-                f"📍 **{zip_code}** shares a region (zip3 = {zip_code[:3]}) with your "
-                f"target area but isn't in your exact list ({target_str})."
+                f"📍 **{zip_code}** is **{dist:.0f} mi** from {nearest} — "
+                f"within your {target_radius}-mile radius."
+            )
+        elif state == "unknown":
+            st.caption(
+                f"📍 Couldn't geocode **{zip_code}** — area badge skipped. "
+                "(First-time geocoder download can take a moment; try again.)"
             )
         else:
-            st.warning(
-                f"⚠️ **{zip_code}** is outside your target area ({target_str}). "
-                "Worth evaluating only if it's clearly a better deal."
-            )
+            # 'out' — informational, not a warning
+            base = f"📍 **{zip_code}**"
+            if dist is not None and nearest is not None:
+                base += f" is **{dist:.0f} mi** from your nearest target ({nearest})"
+            base += f" — outside your {target_radius}-mile radius. Still worth a look if the numbers are right."
+            st.info(base)
 
     c4, c5, c6 = st.columns(3)
     beds = c4.number_input("Beds", 1, 10, int(fetched.get("beds") or 3))
@@ -667,7 +755,7 @@ with tab_eval:
         row = {
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "address": address, "state": state_code, "zip": zip_code,
-            "in_target_area": zip_match(zip_code, target_zips),
+            "in_target_area": zip_match(zip_code, target_zips, target_radius)[0],
             "price": price, "rent_mo": rent_mo,
             "beds": beds, "baths": baths, "sqft": sqft,
             "cap_rate_pct": round(m["cap_rate"] * 100, 2),
@@ -750,9 +838,9 @@ with tab_batch:
             progress.empty()
 
             if results:
-                # Add target-area badge per row (target_zips is in scope here).
+                # Add target-area badge per row (target_zips/target_radius in scope).
                 for r in results:
-                    r["in_area"] = zip_match(r["zip"], target_zips)
+                    r["in_area"] = zip_match(r["zip"], target_zips, target_radius)[0]
 
                 results.sort(key=lambda x: x["score"], reverse=True)
 
@@ -761,8 +849,9 @@ with tab_batch:
                     "Address": (r["address"] or "—")[:48],
                     "Zip": r["zip"] or "—",
                     "Area": {"exact": "✅ in area",
-                              "region": "🟡 region",
-                              "out": "🔴 outside"}.get(r["in_area"], "—"),
+                              "in_radius": "🟢 in radius",
+                              "out": "⚪ outside",
+                              "unknown": "—"}.get(r["in_area"], "—"),
                     "Price": f"${r['price']:,.0f}",
                     "BD/BA": f"{r['beds'] or '?'}/{r['baths'] or '?'}",
                     "Sqft": r["sqft"] or "—",
@@ -794,9 +883,10 @@ with tab_batch:
 
                 top = results[0]
                 lev_str = f" • leverage: **{top['leverage']}**" if top["leverage"] else ""
-                area_str = {"exact": " • ✅ in target area",
-                             "region": " • 🟡 region-match",
-                             "out": " • 🔴 outside target area"}.get(top["in_area"], "")
+                area_str = {"exact": " • ✅ in search area",
+                             "in_radius": " • 🟢 in radius",
+                             "out": " • ⚪ outside radius",
+                             "unknown": ""}.get(top["in_area"], "")
                 st.success(
                     f"🥇 **Top pick:** {top['address']}  \n"
                     f"Best scenario *{top['best_scenario']}* → "
