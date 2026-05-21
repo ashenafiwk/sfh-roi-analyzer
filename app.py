@@ -9,6 +9,7 @@ Run locally:
     streamlit run app.py
 """
 
+import concurrent.futures
 import io
 import os
 import re
@@ -43,7 +44,7 @@ STATES_BY_CODE = {row["state"]: row for _, row in states.iterrows()}
 STATE_LABELS = [f"{r['state']} — {r['state_name']}" for _, r in states.iterrows()]
 LABEL_TO_CODE = {f"{r['state']} — {r['state_name']}": r["state"] for _, r in states.iterrows()}
 
-STATE_IN_ADDR = re.compile(r"\b([A-Z]{2})\b\s*\d{5}")
+STATE_IN_ADDR = re.compile(r"\b([A-Z]{2})\b[\s,]+\d{5}")
 
 
 def state_from_address(addr: str) -> str | None:
@@ -78,6 +79,119 @@ if "price_input" not in st.session_state:
     st.session_state.price_input = 400_000
 if "asking_price" not in st.session_state:
     st.session_state.asking_price = None  # what the listing actually asks
+
+
+def _safe_zip(data: dict, address: str) -> str:
+    """Return the property zip. The scraper's `zip` field sometimes captures
+    the street number, so prefer the *last* 5-digit run in the address."""
+    addr_zips = re.findall(r"\b(\d{5})\b", address or "")
+    if addr_zips:
+        return addr_zips[-1]
+    z = str(data.get("zip") or "")
+    return z if (z.isdigit() and len(z) == 5) else ""
+
+
+def _analyze_one_url(url: str, base_a: Assumptions) -> dict:
+    """Fetch + analyze a single URL. Returns a row dict for the batch table,
+    or {'url': ..., 'error': ...} on failure."""
+    try:
+        r = parse_listing(url)
+    except Exception as e:
+        return {"url": url, "error": f"fetch crashed: {type(e).__name__}: {e}"}
+
+    if "error" in r and not r.get("partial"):
+        return {"url": url, "error": r["error"]}
+
+    data = r if "error" not in r else r["partial"]
+
+    price = data.get("price")
+    if not price:
+        return {"url": url, "error": "no price extracted"}
+
+    address = data.get("address") or ""
+    zip_code = _safe_zip(data, address)
+    state_code = state_from_address(address)
+    if state_code and state_code in STATES_BY_CODE:
+        state_row = STATES_BY_CODE[state_code]
+        tax_rate = float(state_row["property_tax_rate"])
+        insurance_yr = float(state_row["avg_insurance_yr"])
+    else:
+        tax_rate = 0.011
+        insurance_yr = 1400
+
+    rent_mo = data.get("rent_zestimate") or round(price * 0.008)
+    hoa_mo = data.get("hoa_mo") or 0
+
+    # Build per-property base assumptions: state insurance overrides the sidebar
+    # placeholder; scenarios will override financing fields on top of this.
+    a = Assumptions(
+        down_pct=base_a.down_pct,
+        mortgage_rate=base_a.mortgage_rate,
+        loan_years=base_a.loan_years,
+        insurance_yr=insurance_yr,
+        vacancy_pct=base_a.vacancy_pct,
+        maintenance_pct=base_a.maintenance_pct,
+        mgmt_pct=base_a.mgmt_pct,
+        appreciation=base_a.appreciation,
+        rent_growth=base_a.rent_growth,
+    )
+    scenarios = analyze_scenarios(price, rent_mo, tax_rate, a, hoa_mo=hoa_mo)
+    best_name, best_m = max(scenarios.items(), key=lambda kv: kv[1]["irr_approx_5yr"])
+
+    # Leverage from property history if scraped.
+    history = data.get("history") or []
+    leverage = ""
+    dom = None
+    cuts = 0
+    rec_offer_mid = None
+    if history:
+        sig = analyze_history(history, current_price=price)
+        leverage = sig.leverage_label
+        dom = sig.days_on_market
+        cuts = sig.cuts_current_run
+        if sig.recommended_offer_low and sig.recommended_offer_high:
+            rec_offer_mid = round(
+                (sig.recommended_offer_low + sig.recommended_offer_high) / 2 / 1000
+            ) * 1000
+
+    # Deal score — mirrors roi_analyzer.rank_score with a leverage bonus.
+    score = (
+        best_m["cap_rate"] * 150
+        + best_m["coc_return"] * 100
+        + best_m["irr_approx_5yr"] * 80
+    )
+    if best_m["monthly_cash_flow"] < 0:
+        score -= 5
+    score += min(best_m["one_pct_rule"] * 100, 1.0) * 5
+    if leverage.startswith("STRONG"):
+        score += 10
+    elif leverage.startswith("MILD"):
+        score += 5
+    elif leverage.startswith("HOT"):
+        score -= 3
+
+    return {
+        "url": url,
+        "address": address,
+        "state": state_code or "?",
+        "zip": zip_code,
+        "price": price,
+        "beds": data.get("beds"),
+        "baths": data.get("baths"),
+        "sqft": data.get("sqft"),
+        "rent_mo": rent_mo,
+        "best_scenario": best_name,
+        "monthly_cf": best_m["monthly_cash_flow"],
+        "irr_5yr": best_m["irr_approx_5yr"],
+        "cap_rate": best_m["cap_rate"],
+        "coc": best_m["coc_return"],
+        "breakeven_rent": best_m["breakeven_rent_mo"],
+        "leverage": leverage,
+        "dom": dom,
+        "cuts": cuts,
+        "rec_offer": rec_offer_mid,
+        "score": score,
+    }
 
 
 def add_to_portfolio(row: dict):
@@ -135,8 +249,8 @@ st.caption(
     "cap rate, cash-on-cash, monthly cash flow, 5-year IRR, plus the classic 1% rule, GRM, and DSCR."
 )
 
-tab_eval, tab_portfolio, tab_states, tab_about = st.tabs(
-    ["Evaluate property", "My portfolio", "State reference", "About"]
+tab_eval, tab_batch, tab_portfolio, tab_states, tab_about = st.tabs(
+    ["Evaluate property", "Batch screen", "My portfolio", "State reference", "About"]
 )
 
 
@@ -575,7 +689,144 @@ with tab_eval:
         st.success("Saved to portfolio (in-session).")
 
 
-# ─── TAB 2: Portfolio ────────────────────────────────────────────────────────
+# ─── TAB 2: Batch screen ─────────────────────────────────────────────────────
+with tab_batch:
+    st.markdown("### Batch screen URLs")
+    st.caption(
+        "Paste 5–20 Zillow or Redfin listing URLs (one per line). Each is fetched, "
+        "ROI-analyzed under all three financing scenarios, ranked by deal score, "
+        "and tagged with leverage/days-on-market where history is available. "
+        "Sidebar assumptions still apply; tax + insurance come from each property's "
+        "detected state."
+    )
+
+    urls_text = st.text_area(
+        "Listing URLs (one per line)",
+        height=180,
+        placeholder=(
+            "https://www.redfin.com/MD/Silver-Spring/...\n"
+            "https://www.zillow.com/homedetails/...\n"
+            "https://www.redfin.com/..."
+        ),
+        key="batch_urls",
+    )
+
+    do_batch = st.button("Analyze all", type="primary", key="do_batch")
+
+    if do_batch and urls_text.strip():
+        urls = [u.strip() for u in urls_text.splitlines() if u.strip().startswith("http")]
+        # Dedupe while preserving order.
+        seen: set[str] = set()
+        urls = [u for u in urls if not (u in seen or seen.add(u))]
+
+        if not urls:
+            st.warning("No valid URLs found. Each URL must start with http(s)://")
+        else:
+            base_a = Assumptions(
+                down_pct=down,
+                mortgage_rate=rate,
+                loan_years=loan_years,
+                insurance_yr=1400,  # per-property state default overrides this
+                vacancy_pct=vacancy,
+                maintenance_pct=maint,
+                mgmt_pct=mgmt,
+                appreciation=appreciation,
+                rent_growth=rent_growth,
+            )
+
+            results: list[dict] = []
+            errors: list[dict] = []
+            progress = st.progress(0.0, text=f"Analyzing {len(urls)} listings…")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                futures = {ex.submit(_analyze_one_url, u, base_a): u for u in urls}
+                for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+                    row = fut.result()
+                    if "error" in row:
+                        errors.append(row)
+                    else:
+                        results.append(row)
+                    progress.progress(i / len(urls), text=f"Analyzed {i}/{len(urls)}")
+            progress.empty()
+
+            if results:
+                # Add target-area badge per row (target_zips is in scope here).
+                for r in results:
+                    r["in_area"] = zip_match(r["zip"], target_zips)
+
+                results.sort(key=lambda x: x["score"], reverse=True)
+
+                df = pd.DataFrame([{
+                    "Rank": i + 1,
+                    "Address": (r["address"] or "—")[:48],
+                    "Zip": r["zip"] or "—",
+                    "Area": {"exact": "✅ in area",
+                              "region": "🟡 region",
+                              "out": "🔴 outside"}.get(r["in_area"], "—"),
+                    "Price": f"${r['price']:,.0f}",
+                    "BD/BA": f"{r['beds'] or '?'}/{r['baths'] or '?'}",
+                    "Sqft": r["sqft"] or "—",
+                    "Est rent": f"${r['rent_mo']:,.0f}",
+                    "Best scenario": r["best_scenario"],
+                    "CF/mo": f"${r['monthly_cf']:,.0f}",
+                    "5-yr IRR": f"{r['irr_5yr']*100:.1f}%",
+                    "CoC": f"{r['coc']*100:.1f}%",
+                    "Cap": f"{r['cap_rate']*100:.2f}%",
+                    "BE rent": f"${r['breakeven_rent']:,.0f}",
+                    "Leverage": r["leverage"] or "—",
+                    "DOM": r["dom"] if r["dom"] is not None else "—",
+                    "Cuts": r["cuts"],
+                    "Rec offer": f"${r['rec_offer']:,.0f}" if r["rec_offer"] else "—",
+                    "Score": round(r["score"], 1),
+                    "URL": r["url"],
+                } for i, r in enumerate(results)])
+
+                st.markdown(f"#### Ranked results ({len(results)} of {len(urls)})")
+                st.dataframe(
+                    df,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "URL": st.column_config.LinkColumn("Link", display_text="open ↗"),
+                        "Score": st.column_config.NumberColumn("Score", format="%.1f"),
+                    },
+                )
+
+                top = results[0]
+                lev_str = f" • leverage: **{top['leverage']}**" if top["leverage"] else ""
+                area_str = {"exact": " • ✅ in target area",
+                             "region": " • 🟡 region-match",
+                             "out": " • 🔴 outside target area"}.get(top["in_area"], "")
+                st.success(
+                    f"🥇 **Top pick:** {top['address']}  \n"
+                    f"Best scenario *{top['best_scenario']}* → "
+                    f"${top['monthly_cf']:,.0f}/mo CF, "
+                    f"{top['irr_5yr']*100:.1f}% 5-yr IRR, "
+                    f"cap {top['cap_rate']*100:.2f}%"
+                    f"{lev_str}{area_str}"
+                )
+
+                buf = io.StringIO()
+                pd.DataFrame(results).to_csv(buf, index=False)
+                st.download_button(
+                    "📥 Download as CSV",
+                    buf.getvalue(),
+                    file_name=f"batch_screen_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                )
+
+            if errors:
+                with st.expander(f"⚠️ Errors ({len(errors)})", expanded=False):
+                    for e in errors:
+                        st.markdown(f"- `{e['url']}` — {e['error']}")
+                st.caption(
+                    "Tip: the scrapers occasionally get blocked or hit a non-detail page. "
+                    "Try the URL one-at-a-time in the **Evaluate property** tab — that flow "
+                    "also exposes a 'paste history' fallback when auto-scraping is partial."
+                )
+
+
+# ─── TAB 3: Portfolio ────────────────────────────────────────────────────────
 with tab_portfolio:
     st.markdown("### Saved properties")
     st.caption(
@@ -618,7 +869,7 @@ with tab_portfolio:
             st.rerun()
 
 
-# ─── TAB 3: State reference ──────────────────────────────────────────────────
+# ─── TAB 4: State reference ──────────────────────────────────────────────────
 with tab_states:
     st.markdown("### State property tax + insurance reference")
     st.caption(
@@ -636,7 +887,7 @@ with tab_states:
     st.dataframe(df, hide_index=True, use_container_width=True)
 
 
-# ─── TAB 4: About ────────────────────────────────────────────────────────────
+# ─── TAB 5: About ────────────────────────────────────────────────────────────
 with tab_about:
     st.markdown("""
 ### What this is
